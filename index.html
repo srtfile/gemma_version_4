@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stream Resolver</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f0f0f; color: #e0e0e0; font-family: 'Segoe UI', monospace; min-height: 100vh; padding: 20px; }
+  h1 { text-align: center; color: #7c6aff; margin-bottom: 24px; font-size: 1.6rem; letter-spacing: 2px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-bottom: 24px; }
+  input { background: #1a1a2e; border: 1px solid #333; color: #e0e0e0; padding: 10px 14px; border-radius: 8px; font-size: 0.95rem; outline: none; }
+  input:focus { border-color: #7c6aff; }
+  button { background: #7c6aff; color: #fff; border: none; padding: 10px 24px; border-radius: 8px; cursor: pointer; font-size: 0.95rem; font-weight: 600; transition: background 0.2s; }
+  button:hover { background: #5a48d4; }
+  button:disabled { background: #444; cursor: not-allowed; }
+  #log { background: #111; border: 1px solid #222; border-radius: 10px; padding: 16px; min-height: 80px; font-size: 0.82rem; line-height: 1.7; white-space: pre-wrap; word-break: break-all; margin-bottom: 20px; max-height: 300px; overflow-y: auto; }
+  .results { display: flex; flex-direction: column; gap: 14px; }
+  .track-card { background: #161625; border: 1px solid #2a2a3d; border-radius: 10px; padding: 14px 18px; }
+  .track-title { font-weight: 700; color: #7c6aff; margin-bottom: 10px; font-size: 0.95rem; }
+  .stream-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; border-bottom: 1px solid #1e1e30; flex-wrap: wrap; }
+  .stream-row:last-child { border-bottom: none; }
+  .stream-url { font-size: 0.78rem; color: #a0d4ff; flex: 1; word-break: break-all; }
+  .copy-btn { background: #2a2a3d; color: #ccc; border: none; border-radius: 5px; padding: 4px 10px; font-size: 0.72rem; cursor: pointer; white-space: nowrap; }
+  .copy-btn:hover { background: #7c6aff; color: #fff; }
+  .err  { color: #ff6d6d; }
+  .ok   { color: #6dff6d; }
+  .warn { color: #ffb86c; }
+  .backend-status { text-align: center; font-size: 0.75rem; color: #555; margin-bottom: 14px; }
+  .backend-status span { color: #7c6aff; }
+  .summary { text-align: center; color: #aaa; font-size: 0.85rem; margin-bottom: 10px; }
+  .raw-block { background: #0d0d1a; border-radius: 6px; padding: 10px; font-size: 0.75rem; color: #8be9fd; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<h1>⚡ Stream Resolver</h1>
+
+<div class="controls">
+  <input id="imdbId" placeholder="IMDb ID (e.g. tt0800369)" value="tt0800369" style="width:240px"/>
+  <!-- Set your Deno Deploy URL here -->
+  <input id="backendUrl" placeholder="Deno backend URL" value="https://your-project.deno.dev" style="width:260px"/>
+  <button id="resolveBtn" onclick="resolve()">Resolve</button>
+  <button onclick="clearAll()" style="background:#333">Clear</button>
+</div>
+
+<div class="backend-status" id="backendStatus">Backend: <span>not checked</span></div>
+<div id="log">Ready. Enter an IMDb ID and your Deno backend URL, then click Resolve.</div>
+<div class="summary" id="summary"></div>
+<div class="results" id="results"></div>
+
+<script>
+const BASE = "https://gemma416okl.com";
+
+let csrfToken   = null;
+let pageReferer = null;
+let backendUrl  = null;
+
+function log(msg, cls = "") {
+  const el = document.getElementById("log");
+  el.innerHTML += `<span class="${cls}">${escHtml(msg)}</span>\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function setBackendStatus(msg, color) {
+  document.getElementById("backendStatus").innerHTML =
+    `Backend: <span style="color:${color}">${msg}</span>`;
+}
+
+function clearAll() {
+  document.getElementById("log").textContent = "Ready.";
+  document.getElementById("results").innerHTML = "";
+  document.getElementById("summary").textContent = "";
+  csrfToken = null; pageReferer = null;
+  setBackendStatus("not checked", "#555");
+}
+
+function tryBase64(text) {
+  try {
+    const d = atob(text.trim());
+    if (["{","[","#","h"].includes(d[0])) return d;
+  } catch (_) {}
+  return text;
+}
+
+// All requests go through Deno backend
+async function backendFetch(targetUrl, method = "GET", token = null, referer = null) {
+  const params = new URLSearchParams({ url: targetUrl, method });
+  if (token)   params.set("token", token);
+  if (referer) params.set("referer", referer);
+
+  const res = await fetch(`${backendUrl}/fetch?${params}`, {
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error(`backend HTTP ${res.status}`);
+  return await res.text();
+}
+
+async function checkBackend() {
+  setBackendStatus("checking…", "#ffb86c");
+  try {
+    const res = await fetch(`${backendUrl}/`, { signal: AbortSignal.timeout(8000) });
+    if (res.ok) {
+      setBackendStatus("✓ online", "#6dff6d");
+      return true;
+    }
+    setBackendStatus("✗ offline", "#ff6d6d");
+    return false;
+  } catch (e) {
+    setBackendStatus(`✗ ${e.message}`, "#ff6d6d");
+    return false;
+  }
+}
+
+function flatten(obj) {
+  if (Array.isArray(obj)) return obj.flatMap(flatten);
+  if (obj && typeof obj === "object") return [obj];
+  return [];
+}
+
+function renderCard(lang, content) {
+  const wrap = document.getElementById("results");
+  const card = document.createElement("div");
+  card.className = "track-card";
+  const lines = content.split("\n").filter(l => l.trim().startsWith("http"));
+  const inner = lines.length > 0
+    ? lines.map(u => `
+        <div class="stream-row">
+          <span class="stream-url">${escHtml(u.trim())}</span>
+          <button class="copy-btn" onclick="copyUrl(this,'${escHtml(u.trim())}')">Copy</button>
+        </div>`).join("")
+    : `<div class="raw-block">${escHtml(content.slice(0,2000))}</div>`;
+  card.innerHTML = `<div class="track-title">[${escHtml(lang)}]</div>${inner}`;
+  wrap.appendChild(card);
+  return lines.length;
+}
+
+function copyUrl(btn, url) {
+  navigator.clipboard.writeText(url).catch(() => prompt("Copy:", url));
+  btn.textContent = "✓";
+  setTimeout(() => btn.textContent = "Copy", 1500);
+}
+
+async function resolve() {
+  const imdbId = document.getElementById("imdbId").value.trim();
+  backendUrl   = document.getElementById("backendUrl").value.trim().replace(/\/$/, "");
+  if (!imdbId)     { alert("Enter an IMDb ID"); return; }
+  if (!backendUrl) { alert("Enter your Deno backend URL"); return; }
+
+  document.getElementById("resolveBtn").disabled = true;
+  document.getElementById("results").innerHTML   = "";
+  document.getElementById("summary").textContent = "";
+  document.getElementById("log").textContent     = "";
+
+  // Step 1 — check backend
+  const alive = await checkBackend();
+  if (!alive) {
+    log("✗ Backend unreachable. Check your Deno Deploy URL.", "err");
+    document.getElementById("resolveBtn").disabled = false;
+    return;
+  }
+
+  pageReferer = `${BASE}/play/${imdbId}`;
+  log(`Fetching page via backend: ${pageReferer}\n`);
+
+  // Step 2 — fetch page
+  let html;
+  try {
+    html = await backendFetch(pageReferer);
+    log(`  ✓ Page fetched (${html.length} bytes)`, "ok");
+  } catch (e) {
+    log(`  ✗ Page fetch failed: ${e.message}`, "err");
+    document.getElementById("resolveBtn").disabled = false;
+    return;
+  }
+
+  // Step 3 — extract p3
+  const cfgMatch = html.match(/let\s+p3\s*=\s*(\{[\s\S]+?\});/);
+  if (!cfgMatch) {
+    log("  ✗ p3 config not found.", "err");
+    log(`Page snippet:\n${html.slice(0,800)}`, "warn");
+    document.getElementById("resolveBtn").disabled = false;
+    return;
+  }
+
+  let cfg;
+  try { cfg = JSON.parse(cfgMatch[1]); }
+  catch(e) {
+    log(`  ✗ p3 parse error: ${e.message}`, "err");
+    document.getElementById("resolveBtn").disabled = false;
+    return;
+  }
+
+  csrfToken       = cfg.key;
+  const filePath  = cfg.file;
+  log(`  ✓ Token: ${csrfToken.slice(0,30)}...`, "ok");
+  log(`  ✓ File:  ${filePath.slice(0,60)}...`, "ok");
+
+  // Step 4 — fetch track list via POST
+  log(`\nFetching track list (POST)...`);
+  let tracks;
+  try {
+    const rawStr  = tryBase64(await backendFetch(filePath, "POST", csrfToken, pageReferer));
+    const rawData = JSON.parse(rawStr);
+    tracks = flatten(rawData).filter(t => t.file);
+    log(`  ✓ ${tracks.length} track(s) found`, "ok");
+  } catch(e) {
+    log(`  ✗ Track list failed: ${e.message}`, "err");
+    document.getElementById("resolveBtn").disabled = false;
+    return;
+  }
+
+  // Step 5 — fetch each playlist
+  let totalUrls = 0;
+  for (const t of tracks) {
+    const fp    = String(t.file || "");
+    const lang  = String(t.title || "unknown");
+    const pl    = fp.startsWith("~") ? fp.slice(1) + ".txt" : fp;
+    const plUrl = `${BASE}/playlist/${encodeURIComponent(pl)}`;
+
+    log(`\nFetching [${lang}]: ${pl.slice(0,60)}...`);
+    try {
+      const raw   = tryBase64(await backendFetch(plUrl, "POST", csrfToken, pageReferer));
+      const count = renderCard(lang, raw.trim());
+      totalUrls  += count;
+      log(`  ✓ ${count} URL(s)`, "ok");
+    } catch(e) {
+      log(`  ✗ [${lang}] failed: ${e.message}`, "err");
+    }
+  }
+
+  log(`\nDone — ${totalUrls} stream URL(s) found`);
+  document.getElementById("summary").textContent =
+    `✓ ${totalUrls} URL(s) across ${tracks.length} track(s)`;
+  document.getElementById("resolveBtn").disabled = false;
+}
+</script>
+</body>
+</html>
